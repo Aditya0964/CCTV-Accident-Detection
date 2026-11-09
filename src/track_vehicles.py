@@ -89,7 +89,7 @@ def run(args):
                     for (x1, y1, x2, y2), track_id, class_id, confidence in zip(coordinates, ids, classes, confidences):
                         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
                         class_name = model.names[class_id]
-                        csv_writer.writerow([frame_index, f"{timestamp:.3f}", track_id, class_id, class_name, f"{confidence:.4f}", f"{x1:.2f}", f"{y1:.2f}", f"{x2:.2f}", f"{y2:.2f}", f"{cx:.2f}", f"{cy:.2f}"])
+                        csv_writer.writerow([frame_index, f"{timestamp:.6f}", track_id, class_id, class_name, f"{confidence:.4f}", f"{x1:.2f}", f"{y1:.2f}", f"{x2:.2f}", f"{y2:.2f}", f"{cx:.2f}", f"{cy:.2f}"])
                         trails[track_id].append((int(cx), int(cy)))
 
                         cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 200, 0), 2)

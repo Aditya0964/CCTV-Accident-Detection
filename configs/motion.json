@@ -1,0 +1,20 @@
+{
+  "history_seconds": 3.0,
+  "previous_window_seconds": 0.5,
+  "recent_window_seconds": 0.5,
+  "max_sample_gap_seconds": 0.30,
+  "min_samples_per_window": 2,
+  "speed_smoothing_samples": 3,
+  "min_moving_speed_px_s": 25.0,
+  "speed_drop_ratio": 0.25,
+  "direction_window_seconds": 0.25,
+  "direction_threshold_deg": 50.0,
+  "min_direction_displacement_px": 5.0,
+  "proximity_threshold": 0.85,
+  "iou_threshold": 0.03,
+  "interaction_event_seconds": 2.0,
+  "stationary_speed_px_s": 12.0,
+  "stationary_duration_seconds": 0.5,
+  "candidate_score_threshold": 5,
+  "event_cooldown_seconds": 3.0
+}
