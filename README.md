@@ -71,6 +71,43 @@ Outputs:
 - `outputs/candidates/candidate_XXX.mp4` & `.jpg` — extracted `[t - 2s, t + 2s]` temporal clips and keyframes (when `--extract-clips` is set)
 - `outputs/anomaly_preview.mp4` — annotated anomaly debug video (when `--render-video` is set)
 
+## Phase 3 — Video Accident Confirmation & Event Manager
+
+Phase 3 trains and evaluates binary video classifiers on SCAD clips (`mean_pool` baseline and `cnn_lstm` temporal model), confirms Phase 2 candidates ($P_{\text{acc}} > T_c$), and deduplicates confirmed incidents using a 5-second cooldown event manager.
+
+### 1. Train Baseline & CNN + LSTM on SCAD
+
+Supports `{data_dir}/{train,val,test}/{accident,normal}/`, `{data_dir}/{accident,normal}/`, or a `--manifest` CSV (`path,label,split,video_group`):
+
+```bash
+python -m src.train_classifier --data-dir data/scad --arch mean_pool --backbone resnet18 --epochs 15 --save-dir outputs/models/baseline
+python -m src.train_classifier --data-dir data/scad --arch cnn_lstm --backbone resnet18 --epochs 15 --save-dir outputs/models/cnn_lstm
+```
+
+### 2. Evaluate (Experiment 1)
+
+Compare `CNN + mean pooling` vs. `CNN + LSTM` on `accuracy`, `precision`, `recall`, `F1`, and `confusion matrix`:
+
+```bash
+python -m src.evaluate_classifier --data-dir data/scad --checkpoints outputs/models/baseline/best.pt outputs/models/cnn_lstm/best.pt --output-dir outputs/eval/experiment1
+```
+
+### 3. Confirm Candidates & Deduplicate Incidents
+
+```bash
+python -m src.confirm_accidents \
+  --candidates outputs/candidates.json \
+  --checkpoint outputs/models/cnn_lstm/best.pt \
+  --video data/raw/test_cctv.mp4 \
+  --render-video
+```
+
+Outputs:
+- `outputs/confirmed_incidents.json` — deduplicated incidents (`incident_id`, `timestamp_hms`, `vehicles`, `accident_confidence`, `motion_score`)
+- `outputs/confirmation_results.json` — per-candidate probabilities and confirm/reject decisions
+- `outputs/confirmed_preview.mp4` — annotated preview showing confirmed vs. rejected candidates (when `--render-video` is set)
+- `outputs/experiment3_comparison.json` — motion-only vs. motion+classifier metrics (when `--ground-truth` is supplied)
+
 ## Tests
 
 ```bash
