@@ -11,7 +11,12 @@ import cv2
 import torch
 
 from src.clip_buffer import compute_resized_dimensions
-from src.event_manager import AccidentEventManager, ConfirmedIncident, write_confirmed_incidents_json
+from src.event_manager import (
+    AccidentEventLogger,
+    AccidentEventManager,
+    ConfirmedIncident,
+    write_confirmed_incidents_json,
+)
 from src.scad_dataset import sample_video_frames
 from src.video_classifier import load_checkpoint, resolve_device
 
@@ -234,9 +239,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     model, cfg, _ = load_checkpoint(args.checkpoint, device=device)
     cutoff = args.threshold if args.threshold is not None else cfg.threshold
 
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    logger = AccidentEventLogger(output_dir=args.output_dir, append=False, echo_console=False)
     manager = AccidentEventManager(
         cooldown_sec=args.cooldown_sec,
         region_iou_threshold=args.region_iou_threshold,
+        logger=logger,
     )
 
     confirmation_results: list[dict[str, Any]] = []
@@ -255,6 +263,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if confirmed:
             inc, is_new_incident = manager.register_confirmed(cand, accident_confidence=p_acc)
             incident_id = inc.incident_id
+        else:
+            manager.record_rejected(cand, accident_confidence=p_acc, threshold=cutoff)
 
         confirmation_results.append(
             {
@@ -262,8 +272,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "timestamp_sec": cand.get("timestamp_sec"),
                 "frame_index": cand.get("frame_index"),
                 "involved_track_ids": cand.get("involved_track_ids", []),
+                "involved_classes": cand.get("involved_classes", []),
                 "candidate_region": cand.get("candidate_region", []),
                 "motion_score": cand.get("motion_score"),
+                "clip_path": cand.get("clip_path"),
+                "keyframe_path": cand.get("keyframe_path"),
                 "p_accident": round(p_acc, 4),
                 "threshold": cutoff,
                 "confirmed": confirmed,
@@ -272,7 +285,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    logger.write_incidents_summary(manager.incidents, export_individual=True, copy_media=True)
     incidents_path = args.output_dir / "confirmed_incidents.json"
     results_path = args.output_dir / "confirmation_results.json"
     write_confirmed_incidents_json(manager.incidents, incidents_path)

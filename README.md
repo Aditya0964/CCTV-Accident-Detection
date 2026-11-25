@@ -105,8 +105,18 @@ python -m src.confirm_accidents \
 Outputs:
 - `outputs/confirmed_incidents.json` — deduplicated incidents (`incident_id`, `timestamp_hms`, `vehicles`, `accident_confidence`, `motion_score`)
 - `outputs/confirmation_results.json` — per-candidate probabilities and confirm/reject decisions
+- `outputs/events.log` & `outputs/events.jsonl` — human-readable and JSONL audit event logs (`INCIDENT_CREATED`, `INCIDENT_MERGED`, `CANDIDATE_REJECTED`)
+- `outputs/incidents.csv` & `outputs/incidents/incident_XXX.{json,mp4,jpg}` — tabular summary and per-incident bundles
 - `outputs/confirmed_preview.mp4` — annotated preview showing confirmed vs. rejected candidates (when `--render-video` is set)
 - `outputs/experiment3_comparison.json` — motion-only vs. motion+classifier metrics (when `--ground-truth` is supplied)
+
+### 4. Standalone Event Logger CLI
+
+Replay `confirmation_results.json`, `confirmed_incidents.json`, or raw `candidates.json` through the cooldown event manager and logger:
+
+```bash
+python -m src.log_events --input outputs/confirmation_results.json --output-dir outputs --echo
+```
 
 ## Tests
 
