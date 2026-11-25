@@ -39,6 +39,40 @@ The first run may download pretrained YOLO weights. Output:
 - CV tracking can fail due to occlusions, camera motion, small objects or ID switches. Inspect tracks before designing accident rules.
 - The initial CSV only includes currently returned tracked detections, not interpolations for lost tracks.
 
-## Next phase
+## Next phase (Phase 2 — Motion Anomaly Detection)
 
-Compute speed drop, heading changes, vehicle proximity/overlap and stopping from `tracks.csv`, then score candidate accident events.
+Phase 2 reads `outputs/tracks.csv` to compute speed drop (Rule A), sharp direction changes (Rule B), size-normalized vehicle proximity & IoU, post-interaction stopping, and weighted motion anomaly scores (`0–9`), grouping peaks into accident candidates and optionally extracting `[t - 2s, t + 2s]` video clips.
+
+Run offline scoring from `tracks.csv`:
+
+```bash
+python -m src.detect_anomalies --tracks outputs/tracks.csv
+```
+
+With source video to extract candidate clips (`outputs/candidates/candidate_XXX.mp4` + `.jpg`) and render a debug preview (`outputs/anomaly_preview.mp4`):
+
+```bash
+python -m src.detect_anomalies \
+  --tracks outputs/tracks.csv \
+  --video data/raw/test_cctv.mp4 \
+  --extract-clips \
+  --render-video
+```
+
+Key flags:
+- `--speed-drop-ratio` (default `0.25`, testable e.g. `0.15`, `0.25`, `0.40`)
+- `--angle-deg` (default `50.0`)
+- `--mode` (`full` for all 5 indicators / max score 9; `motion_only` for speed + direction ablation)
+- `--candidate-threshold` (default `5` in `full` mode, `4` in `motion_only` mode)
+
+Outputs:
+- `outputs/motion_scores.csv` — per-frame, per-track kinematic & interaction metrics and score (`0–9`)
+- `outputs/candidates.json` — deduplicated accident candidates (`timestamp_sec`, `involved_track_ids`, `candidate_region`, `motion_score`, clip bounds)
+- `outputs/candidates/candidate_XXX.mp4` & `.jpg` — extracted `[t - 2s, t + 2s]` temporal clips and keyframes (when `--extract-clips` is set)
+- `outputs/anomaly_preview.mp4` — annotated anomaly debug video (when `--render-video` is set)
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
