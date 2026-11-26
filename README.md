@@ -2,6 +2,26 @@
 
 The main demo is a validation-tuned fusion of a video classifier, an adapted image classifier, and an accident-box detector. On the labeled clips in `data/raw/`, it reached **67.5% accuracy on 166 held-out, source-disjoint test videos**. See [BENCHMARK.md](BENCHMARK.md) for the full confusion matrix, comparison to individual models, data audit, and limitations. The repository also contains the original vehicle-tracking and motion-candidate pipeline.
 
+## Windows desktop review
+
+Double-click `launch_demo.cmd`, select a short CCTV clip, and choose **Analyze video**. The default workflow runs vehicle tracking, motion candidate selection, pretrained ViT detection, and the Firewatch scan. The table shows the clip verdict, scan times, scope, fire and smoke findings, and visual severity. Click a scan row to seek to its timestamp and read the severity reason.
+
+For a clean install, install `requirements.txt` and `requirements-phase4.txt`. Put vehicle weights at `outputs/models/yolo11n.pt` and the [Firewatch YOLO11s ONNX weights](https://github.com/leskoont/firewatch/releases/tag/v0.1.0) at `outputs/models/firewatch-yolo11s.onnx`. Run the pretrained ViT evaluation below to generate `outputs/eval/vit/vit_evaluation.json`, or pass an existing calibration with `launch_demo.cmd --calibration PATH`.
+
+For the fusion path, launch `launch_demo.cmd --backend fusion`. This uses the fusion evaluation report, the fitted ViT and R3D-18 classifiers, and the YOLO11x weights referenced by their reports. Reproduce those assets with the benchmark commands below or copy the existing artifacts into their original paths. A different fusion report can be supplied with `--fusion-report PATH`.
+
+Phase 4 scans up to five seconds after each localized ViT incident. For a positive clip-level verdict with no localized incident it uses an approximate scan time and a scene-wide scan. Fusion supplies a source-pixel box when the strongest detector score reaches 0.25. A scene-wide finding describes the visible scene and cannot establish which vehicle produced the hazard. Persistent fire gives **High** visual severity, persistent smoke gives **Elevated**, and strong tracked multi-vehicle motion can also give **Elevated**. The report explains its evidence and marks incomplete assessments **Unknown**.
+
+The final preview shows a red **ACCIDENT** label near a localized contact. The ViT review requires a candidate score above 0.80, approaching track overlap, and abrupt braking or deflection followed by stopping. The 0.80 review cutoff is a conservative screening setting. The clip verdict still uses its evaluation report's cutoff. Fusion requires a positive clip verdict and a detector box score of at least 0.80 for the red label.
+
+Each run is saved under `outputs/desktop_runs` with the Phase 3 results and rejection reasons, hazard JSON and CSV, the final video preview, and a pipeline log. Use **Open saved analysis** to reopen one of those folders.
+
+To run Phase 4 on existing Phase 3 output:
+
+```powershell
+python -m src.run_phase4 --video 'C:/videos/example.mp4' --clip-result outputs/vit_pipeline/example/vit/example_result.json --incidents outputs/vit_pipeline/example/confirmed_incidents.json --output-dir outputs/phase4/example
+```
+
 ## Recommended demo
 
 Put labeled videos in `data/raw/accident/` and `data/raw/normal/`, install the dependencies below, and from the repository root run:

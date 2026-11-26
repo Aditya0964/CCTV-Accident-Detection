@@ -719,6 +719,7 @@ def group_candidates(
 
         region = union_boxes(boxes, padding_px=config.region_padding_px)
         t_peak = peak.timestamp_sec
+        contact_anchor = _contact_anchor(cluster["entries"], peak, involved_ids, region, score_lookup, config)
 
         candidates.append(
             CandidateEvent(
@@ -754,11 +755,43 @@ def group_candidates(
                     ),
                     "pair_iou": round(peak.pair_iou, 4),
                     "trigger_frames_count": len({e.frame for e in cluster["entries"]}),
+                    "contact_anchor": contact_anchor,
                 },
             )
         )
 
     return candidates
+
+
+def _contact_anchor(entries, peak, involved_ids, peak_region, score_lookup, config) -> dict | None:
+    """Find an earlier overlap in the same event before the vehicles settle."""
+    contacts = []
+    for entry in entries:
+        if not peak.timestamp_sec - config.clip_before_sec <= entry.timestamp_sec <= peak.timestamp_sec:
+            continue
+        if not entry.approaching or not 0.10 <= entry.pair_iou < 0.80 or entry.partner_box is None:
+            continue
+        if entry.track_id not in involved_ids and entry.partner_track_id not in involved_ids:
+            continue
+        region = union_boxes((entry.box, entry.partner_box))
+        if compute_iou(region, peak_region) < config.merge_region_iou:
+            continue
+        contacts.append((entry, region))
+    if not contacts:
+        return None
+    minimum_overlap = 0.90 * max(entry.pair_iou for entry, _ in contacts)
+    entry, box = min(
+        ((entry, box) for entry, box in contacts if entry.pair_iou >= minimum_overlap),
+        key=lambda item: item[0].frame,
+    )
+    partner = score_lookup.get((entry.frame, entry.partner_track_id))
+    return {
+        "timestamp_sec": round(entry.timestamp_sec, 3),
+        "frame_index": entry.frame,
+        "candidate_region": [round(value, 2) for value in box],
+        "involved_track_ids": [entry.track_id, entry.partner_track_id],
+        "involved_classes": [entry.class_name, partner.class_name if partner is not None else "unknown"],
+    }
 
 
 def _candidate_rank(entry: FrameTrackScore) -> tuple[int, float, float, int]:

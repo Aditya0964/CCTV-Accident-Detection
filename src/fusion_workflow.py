@@ -164,10 +164,14 @@ def predict(args: argparse.Namespace) -> dict:
     evidence = np.vstack([np.hstack(tiles[:2]), np.hstack(tiles[2:])]) if len(tiles) == 4 else np.vstack(tiles)
     evidence_path = args.output_dir / f"{args.video.stem}_evidence.jpg"
     cv2.imwrite(str(evidence_path), evidence)
+    peak_index = int(np.argmax(detection["frame_scores"]))
+    peak_box = max(detection["frame_boxes"][peak_index], key=lambda box: box["confidence"], default=None)
     result = {"video": str(args.video), "predicted_accident": predicted,
               "fusion_score": round(fused, 6), "threshold": report["threshold"],
               "component_scores": {name: round(value, 6) for name, value in scores.items()},
-              "peak_detector_time_sec": detection["times_sec"][int(np.argmax(detection["frame_scores"]))],
+              "peak_detector_time_sec": detection["times_sec"][peak_index],
+              "peak_detector_box_xyxy": peak_box["xyxy"] if peak_box else None,
+              "peak_detector_box_score": peak_box["confidence"] if peak_box else None,
               "evidence_image": str(evidence_path)}
     (args.output_dir / f"{args.video.stem}_result.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2), flush=True)

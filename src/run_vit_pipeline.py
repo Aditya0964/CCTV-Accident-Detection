@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 
-def run(video: Path, calibration: Path, output_dir: Path, yolo_model: str) -> dict:
+def stage_commands(video: Path, calibration: Path, output_dir: Path, yolo_model: str) -> list[list[str]]:
     if not video.is_file():
         raise FileNotFoundError(video)
     if not calibration.is_file():
@@ -17,7 +17,7 @@ def run(video: Path, calibration: Path, output_dir: Path, yolo_model: str) -> di
             f"Calibrated ViT report not found: {calibration}. Run 'python -m src.vit_workflow evaluate' first."
         )
     output_dir.mkdir(parents=True, exist_ok=True)
-    commands = [
+    return [
         [sys.executable, "-m", "src.track_vehicles", "--input", str(video),
          "--output-dir", str(output_dir), "--model", yolo_model],
         [sys.executable, "-m", "src.detect_anomalies", "--tracks", str(output_dir / "tracks.csv"),
@@ -26,8 +26,12 @@ def run(video: Path, calibration: Path, output_dir: Path, yolo_model: str) -> di
          "--calibration", str(calibration), "--output-dir", str(output_dir / "vit")],
         [sys.executable, "-m", "src.confirm_accidents", "--candidates",
          str(output_dir / "candidates.json"), "--vit-calibration", str(calibration),
-         "--video", str(video), "--render-video", "--output-dir", str(output_dir)],
+         "--localized-review", "--video", str(video), "--render-video", "--output-dir", str(output_dir)],
     ]
+
+
+def run(video: Path, calibration: Path, output_dir: Path, yolo_model: str) -> dict:
+    commands = stage_commands(video, calibration, output_dir, yolo_model)
     log_path = output_dir / "pipeline.log"
     with log_path.open("w", encoding="utf-8") as log:
         for command in commands:

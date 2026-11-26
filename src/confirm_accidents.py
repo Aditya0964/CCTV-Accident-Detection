@@ -21,6 +21,22 @@ from src.scad_dataset import sample_video_frames
 from src.video_classifier import load_checkpoint, resolve_device
 
 
+LOCALIZED_REVIEW_MIN_SCORE = 0.80
+
+
+def localized_review_candidate(candidate: dict) -> dict | None:
+    """Require contact and a motion response before confirming a localized review alert."""
+    evidence = candidate.get("evidence") or {}
+    if not (evidence.get("bounding_box_overlap") and evidence.get("post_interaction_stopping")
+            and (evidence.get("sudden_speed_drop") or evidence.get("sharp_direction_change"))):
+        return None
+    anchor = (candidate.get("metrics") or {}).get("contact_anchor")
+    if anchor is None or not candidate["clip_start_sec"] <= anchor["timestamp_sec"] <= candidate["clip_end_sec"]:
+        return None
+    # Keep the original scored clip, with the box and timestamp at tracked contact.
+    return {**candidate, **anchor}
+
+
 def _load_candidates(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         raise FileNotFoundError(f"Candidates JSON not found: {path}")
@@ -222,6 +238,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     classifier.add_argument("--vit-calibration", type=Path, help="ViT evaluation JSON with a validated decision rule")
     parser.add_argument("--vit-cache-dir", type=Path, default=Path("outputs/model_cache"))
     parser.add_argument("--threshold", type=float, default=None, help="Override P(accident) confirmation cutoff T_c")
+    parser.add_argument("--localized-review", action="store_true",
+                        help="Require impact evidence and a higher score for a localized ViT alert")
     parser.add_argument("--cooldown-sec", type=float, default=5.0)
     parser.add_argument("--region-iou-threshold", type=float, default=0.10)
     parser.add_argument("--video", type=Path, default=None, help="Source video for clip slicing fallback or --render-video")
@@ -236,6 +254,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.render_video and args.video is None:
         raise ValueError("--video is required when --render-video is set")
+    if args.localized_review and args.vit_calibration is None:
+        raise ValueError("--localized-review requires --vit-calibration")
 
     candidates = _load_candidates(args.candidates)
     device = resolve_device(args.device)
@@ -246,6 +266,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         rule = DecisionRule(**calibration["rule"])
         vit_model = ViTAccidentClassifier(calibration["model"], args.vit_cache_dir, str(device))
         cutoff = args.threshold if args.threshold is not None else rule.threshold
+        if args.localized_review:
+            cutoff = max(cutoff, LOCALIZED_REVIEW_MIN_SCORE)
         num_frames = int(calibration["frames_per_clip"])
     else:
         model, cfg, _ = load_checkpoint(args.checkpoint, device=device)
@@ -279,29 +301,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 cand, model=model, num_frames=cfg.num_frames, input_size=cfg.input_size,
                 device=device, fallback_video=args.video,
             )
-        confirmed = p_acc > cutoff
+        detected = localized_review_candidate(cand) if args.localized_review else cand
+        rejection_reason = None
+        if p_acc <= cutoff:
+            rejection_reason = "Score did not pass the confirmation cutoff"
+        elif detected is None:
+            rejection_reason = "No corroborated tracked contact and motion response in the scored clip"
+        confirmed = rejection_reason is None
         incident_id: Optional[str] = None
         is_new_incident = False
         if confirmed:
-            inc, is_new_incident = manager.register_confirmed(cand, accident_confidence=p_acc)
+            if args.localized_review:
+                detected = {**detected, "confirmation_policy": "vit_impact_review"}
+            inc, is_new_incident = manager.register_confirmed(detected, accident_confidence=p_acc)
             incident_id = inc.incident_id
         else:
-            manager.record_rejected(cand, accident_confidence=p_acc, threshold=cutoff)
+            manager.record_rejected(cand, accident_confidence=p_acc, threshold=cutoff,
+                                    reason=rejection_reason if detected is None and p_acc > cutoff else None)
 
+        review = detected if confirmed else cand
         confirmation_results.append(
             {
                 "candidate_id": cand.get("candidate_id"),
-                "timestamp_sec": cand.get("timestamp_sec"),
-                "frame_index": cand.get("frame_index"),
-                "involved_track_ids": cand.get("involved_track_ids", []),
-                "involved_classes": cand.get("involved_classes", []),
-                "candidate_region": cand.get("candidate_region", []),
+                "timestamp_sec": review.get("timestamp_sec"),
+                "motion_peak_time_sec": cand.get("timestamp_sec"),
+                "frame_index": review.get("frame_index"),
+                "involved_track_ids": review.get("involved_track_ids", []),
+                "involved_classes": review.get("involved_classes", []),
+                "candidate_region": review.get("candidate_region", []),
                 "motion_score": cand.get("motion_score"),
                 "clip_path": cand.get("clip_path"),
                 "keyframe_path": cand.get("keyframe_path"),
                 "p_accident": round(p_acc, 4),
                 "threshold": cutoff,
                 "confirmed": confirmed,
+                "rejection_reason": rejection_reason,
                 "incident_id": incident_id,
                 "new_incident": is_new_incident,
             }

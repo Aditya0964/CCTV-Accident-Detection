@@ -46,6 +46,7 @@ class ConfirmedIncident:
     fire_detected: Optional[bool] = None
     visual_risk: Optional[str] = None
     incident_json_path: Optional[str] = None
+    confirmation_policy: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -311,6 +312,7 @@ class AccidentEventManager:
                     existing.frame_index = frame_idx
                     existing.motion_score = motion_score
                     existing.candidate_region = region_list
+                    existing.confirmation_policy = candidate.get("confirmation_policy")
                     if candidate.get("clip_path"):
                         existing.clip_path = candidate["clip_path"]
                     if candidate.get("keyframe_path"):
@@ -352,6 +354,7 @@ class AccidentEventManager:
             smoke_detected=candidate.get("smoke_detected"),
             fire_detected=candidate.get("fire_detected"),
             visual_risk=candidate.get("visual_risk"),
+            confirmation_policy=candidate.get("confirmation_policy"),
         )
         self._incidents.append(incident)
 
@@ -378,6 +381,7 @@ class AccidentEventManager:
         candidate: dict[str, Any],
         accident_confidence: float,
         threshold: float,
+        reason: Optional[str] = None,
     ) -> None:
         """Log a candidate rejected by the video classifier for auditability."""
         if self.logger is None:
@@ -392,7 +396,7 @@ class AccidentEventManager:
             candidate_region=[float(v) for v in candidate.get("candidate_region", [])],
             motion_score=int(candidate.get("motion_score", 0)),
             accident_confidence=accident_confidence,
-            reason=f"P(accident)={accident_confidence:.4f} <= threshold {threshold:.4f}",
+            reason=reason or f"P(accident)={accident_confidence:.4f} <= threshold {threshold:.4f}",
         )
 
 
