@@ -16,6 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 import cv2
 from PIL import Image, ImageTk
 
+from src.clip_buffer import compute_resized_dimensions
 from src.demo_pipeline import STAGES, DemoPipeline, DemoSettings, RunCancelled
 
 
@@ -25,6 +26,10 @@ LINE, HOVER = "#27384D", "#25364C"
 FONT = "Segoe UI"
 
 BACKEND_NAMES = {"vit": "Pretrained ViT", "fusion": "ViT + R3D-18 + YOLO11x"}
+HAZARD_COLUMNS = (("time", "Scan time", 77), ("score", "Score", 72), ("scope", "Scope", 91),
+                  ("fire", "Fire", 100), ("smoke", "Smoke", 100), ("risk", "Visual severity", 128))
+CANDIDATE_COLUMNS = (("time", "Candidate time", 115), ("score", "ViT score", 95),
+                     ("motion", "Motion score", 100), ("status", "Review status", 155))
 
 
 def clock_label(seconds: float) -> str:
@@ -32,10 +37,25 @@ def clock_label(seconds: float) -> str:
     return f"{whole // 60:02d}:{whole % 60:02d}"
 
 
+def load_candidate_rows(folder: Path) -> list[dict]:
+    audit = folder / "detection" / "confirmation_results.json"
+    if not audit.is_file():
+        return []
+    proposals_path = audit.with_name("candidates.json")
+    proposals = json.loads(proposals_path.read_text(encoding="utf-8")) if proposals_path.is_file() else []
+    proposals_by_id = {row["candidate_id"]: row for row in proposals}
+    scored = json.loads(audit.read_text(encoding="utf-8"))
+    return sorted(
+        ({**proposals_by_id.get(row["candidate_id"], {}), **row} for row in scored),
+        key=lambda row: float(row["timestamp_sec"]),
+    )
+
+
 class VideoPlayer:
     def __init__(self, parent):
         self.capture = None
         self.frame = None
+        self.candidate = None
         self.photo = None
         self.timer = None
         self.index = self.count = 0
@@ -65,6 +85,7 @@ class VideoPlayer:
             self.capture.release()
             self.capture = None
         self.frame = None
+        self.candidate = None
         self.track_position.set(0)
         self.slider.configure(state="disabled")
         self.play_button.configure(state="disabled")
@@ -103,6 +124,35 @@ class VideoPlayer:
         resized = cv2.resize(self.frame, size, interpolation=cv2.INTER_AREA if ratio < 1 else cv2.INTER_LINEAR)
         self.photo = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
         self.area.create_image(width // 2, height // 2, image=self.photo, tags="preview")
+        if self.candidate is not None:
+            self.draw_candidate(width // 2 - size[0] / 2, height // 2 - size[1] / 2, size,
+                                original_w, original_h)
+
+    def draw_candidate(self, left, top, size, original_w, original_h):
+        timestamp, box = self.candidate
+        if abs(self.index / self.fps - timestamp) > 0.40:
+            return
+        tracking_w, tracking_h = compute_resized_dimensions(original_w, original_h, 960)
+        x1, y1, x2, y2 = (min(1.0, max(0.0, value / extent)) for value, extent in
+                          zip(box, (tracking_w, tracking_h, tracking_w, tracking_h)))
+        if x2 <= x1 or y2 <= y1:
+            return
+        a, b = left + x1 * size[0], top + y1 * size[1]
+        color = "#6ECFFF"
+        self.area.create_rectangle(a, b, left + x2 * size[0], top + y2 * size[1],
+                                   outline=color, width=2, dash=(5, 3), tags=("preview", "review-candidate"))
+        self.area.create_text(a + 4, max(top + 13, b - 9), text="CANDIDATE", fill=color,
+                              anchor="w", font=(FONT, 9, "bold"), tags=("preview", "review-candidate"))
+
+    def review_candidate(self, row):
+        self.candidate = None
+        if row is not None and not row.get("confirmed"):
+            box = row.get("candidate_region")
+            if isinstance(box, list) and len(box) == 4 and all(
+                isinstance(value, (int, float)) and math.isfinite(value) for value in box
+            ):
+                self.candidate = float(row["timestamp_sec"]), box
+        self.redraw()
 
     def show_frame(self, target):
         if self.capture is None or target == self.index:
@@ -152,6 +202,8 @@ class DemoApp:
         self.runner = None
         self.current_report = None
         self.incidents = []
+        self.candidates = []
+        self.show_candidates = False
         self.selected = tk.StringVar()
         self.status = tk.StringVar(value="Ready to review footage")
         self.stage_states = []
@@ -249,31 +301,51 @@ class DemoApp:
         self.count_label.pack(side="left")
         self.report_button = ttk.Button(header, text="Open results folder", command=self.open_folder, state="disabled")
         self.report_button.pack(side="right")
+        self.candidates_button = ttk.Button(header, text="All candidates", command=self.toggle_candidates,
+                                            state="disabled")
+        self.candidates_button.pack(side="right", padx=(0, 8))
         self.verdict_label = self.label(parent, "", PANEL, color=MUTED, size=9)
         self.verdict_label.pack(fill="x", pady=(0, 5))
         self.reason_label = self.label(parent, "", PANEL, color=MUTED, size=9, wraplength=580, justify="left")
         self.reason_label.pack(side="bottom", fill="x", pady=(5, 0))
-        self.table = ttk.Treeview(parent, columns=("time", "score", "scope", "fire", "smoke", "risk"),
-                                  show="headings", height=3, selectmode="browse")
-        for key, name, width in (("time", "Scan time", 77), ("score", "Score", 72),
-                                 ("scope", "Scope", 91), ("fire", "Fire", 100),
-                                 ("smoke", "Smoke", 100), ("risk", "Visual severity", 128)):
-            self.table.heading(key, text=name, anchor="w")
-            self.table.column(key, width=width, anchor="w")
+        self.table = ttk.Treeview(parent, show="headings", height=3, selectmode="browse")
+        self.configure_table(HAZARD_COLUMNS)
         scroll = ttk.Scrollbar(parent, orient="vertical", command=self.table.yview)
         self.table.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         self.table.pack(fill="x", expand=True)
         self.table.bind("<<TreeviewSelect>>", self.select_incident)
 
+    def configure_table(self, columns):
+        self.table.configure(columns=tuple(key for key, _, _ in columns))
+        for key, name, width in columns:
+            self.table.heading(key, text=name, anchor="w")
+            self.table.column(key, width=width, anchor="w")
+
     def select_incident(self, _event=None):
         selected = self.table.selection()
         if selected:
+            if self.show_candidates:
+                row = self.candidates[int(selected[0])]
+                self.player.go_to(float(row["timestamp_sec"]))
+                self.player.review_candidate(row)
+                reason = "Localized alert confirmed" if row["confirmed"] else row.get("rejection_reason")
+                start, end = row.get("clip_start_sec"), row.get("clip_end_sec")
+                window = f"  •  Scored window {start:.2f}–{end:.2f} s" if start is not None and end is not None else ""
+                self.reason_label.configure(text=f"{reason or 'Flagged for review'}{window}")
+                return
             incident = self.incidents[int(selected[0])]
-            self.player.go_to(float(incident["timestamp_sec"]))
+            timestamp = float(incident["timestamp_sec"])
             reason = incident.get("visual_risk_reason", "")
-            if incident["hazard_scan"]["scope"] == "full_frame":
+            scan = incident["hazard_scan"]
+            if scan["scope"] == "full_frame":
                 reason = f"{reason} Scene-wide scan."
+                strongest = scan.get("strongest_detection", {})
+                cue = strongest.get("fire") or strongest.get("smoke")
+                if cue:
+                    timestamp = cue["timestamp_sec"]
+                    reason = f"{reason} Strongest hazard cue at {timestamp:.2f} s."
+            self.player.go_to(timestamp)
             self.reason_label.configure(text=reason)
 
     def browse(self):
@@ -294,16 +366,21 @@ class DemoApp:
         self.player.clear()
         self.table.delete(*self.table.get_children())
         self.incidents = []
+        self.candidates = []
+        self.show_candidates = False
         self.current_report = None
+        self.configure_table(HAZARD_COLUMNS)
         self.count_label.configure(text="Incident review")
         self.verdict_label.configure(text="")
         self.reason_label.configure(text="")
         self.report_button.configure(state="disabled")
+        self.candidates_button.configure(text="All candidates", state="disabled")
 
     def load_review(self, folder):
         report = folder / "hazard_incidents.json"
         summary = json.loads((folder / "review_summary.json").read_text(encoding="utf-8"))
         incidents = json.loads(report.read_text(encoding="utf-8"))
+        candidates = load_candidate_rows(folder)
         if not isinstance(incidents, list) or any(
             not isinstance(row, dict) or "timestamp_sec" not in row for row in incidents
         ):
@@ -311,20 +388,8 @@ class DemoApp:
         self.clear_review()
         self.player.load(folder / "final_preview.mp4")
         self.incidents = sorted(incidents, key=lambda row: float(row["timestamp_sec"]))
-        for index, row in enumerate(self.incidents):
-            def hazard(key):
-                value = row.get(key)
-                return "Detected" if value is True else "Below cutoff" if value is False else "Unknown"
-            score = row.get("accident_confidence", row.get("clip_score"))
-            time_prefix = "~" if row.get("timestamp_is_approximate") else ""
-            scope = "Scene-wide" if row["hazard_scan"]["scope"] == "full_frame" else "Region"
-            self.table.insert("", "end", iid=str(index), values=(
-                f"{time_prefix}{float(row['timestamp_sec']):.2f} s", "—" if score is None else f"{score:.2f}",
-                scope,
-                hazard("fire_detected"), hazard("smoke_detected"), row.get("visual_risk") or "Unknown",
-            ))
+        self.candidates = candidates
         self.current_report = report
-        self.count_label.configure(text=f"Hazard scans  ·  {len(self.incidents)}")
         self.preview_title.configure(text=Path(summary["video"]).name)
         self.pill.configure(text="ANALYSIS COMPLETE")
         verdict = "Accident signal" if summary["predicted_accident"] else "Below cutoff"
@@ -333,8 +398,55 @@ class DemoApp:
             f"Score {summary['score']:.2f} / cutoff {summary['threshold']:.2f}"
         ))
         self.report_button.configure(state="normal")
+        has_hazard_cues = any(any(row["hazard_scan"].get("hits", {}).values()) for row in self.incidents)
+        self.show_candidates = bool(self.candidates) and not summary["localized_incidents"] and not has_hazard_cues
+        self.populate_results()
+
+    def toggle_candidates(self):
+        self.show_candidates = not self.show_candidates
+        self.populate_results()
+
+    def populate_results(self):
+        self.table.delete(*self.table.get_children())
+        self.player.review_candidate(None)
+        self.reason_label.configure(text="")
+        self.candidates_button.configure(
+            text="Hazard scans" if self.show_candidates else f"All candidates ({len(self.candidates)})",
+            state="normal" if self.candidates else "disabled",
+        )
+        if self.show_candidates:
+            self.configure_table(CANDIDATE_COLUMNS)
+            self.count_label.configure(text=f"All candidates  ·  {len(self.candidates)}")
+            for index, row in enumerate(self.candidates):
+                motion = row.get("motion_score")
+                self.table.insert("", "end", iid=str(index), values=(
+                    f"{row['timestamp_sec']:.2f} s", f"{row['p_accident']:.4f}",
+                    "—" if motion is None else f"{motion}/9",
+                    "Confirmed" if row["confirmed"] else "Unconfirmed",
+                ))
+            self.status.set("Select a row to inspect its proposed region and score.")
+            return
+
+        self.configure_table(HAZARD_COLUMNS)
+        for index, row in enumerate(self.incidents):
+            def hazard(label):
+                value = row.get(f"{label}_detected")
+                if value is True:
+                    return "Detected"
+                if value is False:
+                    return "Intermittent" if row["hazard_scan"].get("hits", {}).get(label) else "Below cutoff"
+                return "Unknown"
+            score = row.get("accident_confidence", row.get("clip_score"))
+            time_prefix = "~" if row.get("timestamp_is_approximate") else ""
+            scope = "Scene-wide" if row["hazard_scan"]["scope"] == "full_frame" else "Region"
+            self.table.insert("", "end", iid=str(index), values=(
+                f"{time_prefix}{float(row['timestamp_sec']):.2f} s", "—" if score is None else f"{score:.2f}",
+                scope,
+                hazard("fire"), hazard("smoke"), row.get("visual_risk") or "Unknown",
+            ))
+        self.count_label.configure(text=f"Hazard scans  ·  {len(self.incidents)}")
         self.status.set("Select a row to review its scan. ~ marks an approximate time."
-                        if incidents else "Analysis complete. No incident window to scan.")
+                        if self.incidents else "Analysis complete. No incident window to scan.")
 
     def open_saved(self):
         folder = filedialog.askdirectory(title="Choose a saved analysis folder")

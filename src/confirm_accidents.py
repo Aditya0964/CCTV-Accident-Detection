@@ -25,9 +25,12 @@ LOCALIZED_REVIEW_MIN_SCORE = 0.80
 
 
 def localized_review_candidate(candidate: dict) -> dict | None:
-    """Require contact and a motion response before confirming a localized review alert."""
+    """Require tracked contact or single-vehicle motion evidence for a localized alert."""
     evidence = candidate.get("evidence") or {}
-    if not (evidence.get("bounding_box_overlap") and evidence.get("post_interaction_stopping")
+    if evidence.get("single_vehicle_track_loss") and len(candidate.get("involved_track_ids", [])) == 1:
+        return candidate
+    if not (evidence.get("bounding_box_overlap")
+            and any(evidence.get(key) for key in ("post_interaction_stopping", "moving_contact", "occluded_contact"))
             and (evidence.get("sudden_speed_drop") or evidence.get("sharp_direction_change"))):
         return None
     anchor = (candidate.get("metrics") or {}).get("contact_anchor")
@@ -306,7 +309,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if p_acc <= cutoff:
             rejection_reason = "Score did not pass the confirmation cutoff"
         elif detected is None:
-            rejection_reason = "No corroborated tracked contact and motion response in the scored clip"
+            rejection_reason = "No corroborated contact or single-vehicle motion evidence in the scored clip"
         confirmed = rejection_reason is None
         incident_id: Optional[str] = None
         is_new_incident = False
@@ -330,6 +333,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "involved_classes": review.get("involved_classes", []),
                 "candidate_region": review.get("candidate_region", []),
                 "motion_score": cand.get("motion_score"),
+                "moving_contact": bool((cand.get("evidence") or {}).get("moving_contact")),
+                "occluded_contact": bool((cand.get("evidence") or {}).get("occluded_contact")),
+                "single_vehicle_track_loss": bool((cand.get("evidence") or {}).get("single_vehicle_track_loss")),
                 "clip_path": cand.get("clip_path"),
                 "keyframe_path": cand.get("keyframe_path"),
                 "p_accident": round(p_acc, 4),

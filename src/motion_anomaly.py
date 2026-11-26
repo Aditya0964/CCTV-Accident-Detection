@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+from bisect import bisect_left
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -84,6 +85,8 @@ class AnomalyConfig:
     clip_before_sec: float = 2.0
     clip_after_sec: float = 2.0
     region_padding_px: float = 24.0
+    preserve_moving_contacts: bool = False
+    tracking_size: tuple[int, int] | None = None
     eps: float = 1e-6
 
     def __post_init__(self) -> None:
@@ -426,12 +429,96 @@ class _PairInteraction:
     partner_stops_ahead: bool
 
 
+@dataclass
+class _MovingContact:
+    first: TrackObservation
+    second: TrackObservation
+    initial_iou: float
+    last_seen: float
+    speed_drop: bool = False
+    direction_change: bool = False
+    emitted: bool = False
+
+
+def _update_moving_contact(
+    active: dict[tuple[int, int], _MovingContact], a: TrackObservation, b: TrackObservation,
+    kin_a: _TrackStepKinematics, kin_b: _TrackStepKinematics, interaction: _PairInteraction,
+    history: list[tuple[float, float, float]], config: AnomalyConfig,
+) -> CandidateEvent | None:
+    """Preserve the first overlap of a moving pair when the contact persists and motion changes."""
+    pair = a.track_id, b.track_id
+    timestamp = a.timestamp_sec
+    if not interaction.overlap or interaction.iou >= 0.80:
+        active.pop(pair, None)
+        return None
+    contact = active.get(pair)
+    if contact is not None and timestamp - contact.last_seen > 0.25:
+        active.pop(pair)
+        contact = None
+
+    if kin_a.stops_ahead or kin_b.stops_ahead:
+        return None
+    if contact is None:
+        if history and timestamp - history[-1][0] <= 0.25 and history[-1][2] >= config.iou_threshold:
+            return None
+        scale = (a.diagonal + b.diagonal) / 2.0
+        if (not interaction.approaching or not (kin_a.segment_valid and kin_b.segment_valid)
+            or min(kin_a.recent_speed_px_s or 0, kin_b.recent_speed_px_s or 0) < 0.35 * scale):
+            return None
+        distance = math.dist(a.center, b.center)
+        if not any(
+            0.20 <= timestamp - t <= config.approach_lookback_sec and old_dist - distance >= 0.40 * scale
+            for t, old_dist, _ in history
+        ):
+            return None
+        contact = _MovingContact(a, b, interaction.iou, timestamp)
+        active[pair] = contact
+
+    contact.last_seen = timestamp
+    contact.speed_drop |= kin_a.sudden_speed_drop or kin_b.sudden_speed_drop
+    contact.direction_change |= kin_a.sharp_direction_change or kin_b.sharp_direction_change
+    initial_time = contact.first.timestamp_sec
+    if (contact.emitted or not 0 < timestamp - initial_time <= 0.35
+        or interaction.iou < max(0.12, contact.initial_iou + 0.04)
+        or not (contact.speed_drop or contact.direction_change)):
+        return None
+
+    score = _compute_weighted_score(
+        mode="full", speed_drop=contact.speed_drop, dir_change=contact.direction_change,
+        very_close=True, overlap=True, post_stopping=False,
+    )
+    if score < config.effective_candidate_threshold():
+        return None
+    contact.emitted = True
+    box = union_boxes((contact.first.box, contact.second.box))
+    anchor = {
+        "timestamp_sec": round(initial_time, 3),
+        "frame_index": contact.first.frame,
+        "candidate_region": [round(v, 2) for v in box],
+        "involved_track_ids": list(pair),
+        "involved_classes": [contact.first.class_name, contact.second.class_name],
+    }
+    return CandidateEvent(
+        candidate_id=0, **anchor,
+        clip_start_sec=round(max(0.0, initial_time - config.clip_before_sec), 3),
+        clip_end_sec=round(initial_time + config.clip_after_sec, 3),
+        motion_score=score, max_score=config.max_possible_score(),
+        evidence={
+            "moving_contact": True, "sudden_speed_drop": contact.speed_drop,
+            "sharp_direction_change": contact.direction_change, "very_close_interaction": True,
+            "bounding_box_overlap": True, "post_interaction_stopping": False,
+        },
+        metrics={"contact_anchor": anchor, "initial_pair_iou": round(contact.initial_iou, 4),
+                 "pair_iou": round(interaction.iou, 4)},
+    )
+
+
 def _evaluate_pair_interaction(
     obs_a: TrackObservation,
     kin_a: _TrackStepKinematics,
     obs_b: TrackObservation,
     kin_b: _TrackStepKinematics,
-    pair_history: list[tuple[float, float]],
+    pair_history: list[tuple[float, float, float]],
     config: AnomalyConfig,
 ) -> _PairInteraction:
     """Compute normalized proximity, IoU, and approaching state for a vehicle pair in one frame."""
@@ -442,7 +529,7 @@ def _evaluate_pair_interaction(
 
     approaching = False
     lookback_cutoff = obs_a.timestamp_sec - config.approach_lookback_sec
-    for prev_t, prev_dist in pair_history:
+    for prev_t, prev_dist, _ in pair_history:
         if prev_t >= lookback_cutoff:
             if dist < prev_dist - 1.0:
                 approaching = True
@@ -501,7 +588,9 @@ def analyze_motion_anomalies(
             kinematics_map[(obs.frame, tid)] = kin
             frames_map[obs.frame].append(obs)
 
-    pair_history: dict[tuple[int, int], list[tuple[float, float]]] = defaultdict(list)
+    pair_history: dict[tuple[int, int], list[tuple[float, float, float]]] = defaultdict(list)
+    active_contacts: dict[tuple[int, int], _MovingContact] = {}
+    independent_candidates: list[CandidateEvent] = []
     frame_scores: list[FrameTrackScore] = []
     threshold = cfg.effective_candidate_threshold()
 
@@ -521,9 +610,13 @@ def analyze_motion_anomalies(
 
                 inter_a = _evaluate_pair_interaction(obs_a, kin_a, obs_b, kin_b, hist, cfg)
                 inter_b = _evaluate_pair_interaction(obs_b, kin_b, obs_a, kin_a, hist, cfg)
+                if cfg.preserve_moving_contacts and cfg.mode == "full":
+                    contact = _update_moving_contact(active_contacts, obs_a, obs_b, kin_a, kin_b, inter_a, hist, cfg)
+                    if contact is not None:
+                        independent_candidates.append(contact)
 
                 dist_now = math.hypot(obs_a.center_x - obs_b.center_x, obs_a.center_y - obs_b.center_y)
-                hist.append((obs_a.timestamp_sec, dist_now))
+                hist.append((obs_a.timestamp_sec, dist_now, inter_a.iou))
                 # Prune stale pair history beyond approach lookback window.
                 cutoff = obs_a.timestamp_sec - cfg.approach_lookback_sec - 0.5
                 while hist and hist[0][0] < cutoff:
@@ -602,7 +695,198 @@ def analyze_motion_anomalies(
             )
 
     candidates = group_candidates(frame_scores, cfg)
+    if cfg.preserve_moving_contacts and cfg.mode == "full":
+        independent_candidates.extend(_occluded_contact_candidates(by_track, frames_map, cfg))
+    if cfg.tracking_size is not None and cfg.mode == "full":
+        independent_candidates.extend(_single_vehicle_candidates(by_track, frames_map, cfg.tracking_size, cfg))
+    by_contact = {(c.frame_index, tuple(sorted(c.involved_track_ids))): index for index, c in enumerate(candidates)}
+    for proposal in independent_candidates:
+        key = proposal.frame_index, tuple(proposal.involved_track_ids)
+        existing = by_contact.get(key)
+        if existing is None:
+            proposal.candidate_id = len(candidates) + 1
+            by_contact[key] = len(candidates)
+            candidates.append(proposal)
+        else:
+            proposal.candidate_id = candidates[existing].candidate_id
+            candidates[existing] = proposal
     return frame_scores, candidates
+
+
+def _terminal_speed_ratio(track: list[TrackObservation], config: AnomalyConfig) -> float | None:
+    last = track[-1]
+    offsets = (0.38, 0.18, 0.14)
+    lookback = track[bisect_left(track, last.timestamp_sec - 0.44, key=lambda obs: obs.timestamp_sec):]
+    first, middle, recent = [min(lookback, key=lambda obs: abs(last.timestamp_sec - offset - obs.timestamp_sec))
+                             for offset in offsets]
+    if any(abs(last.timestamp_sec - offset - obs.timestamp_sec) > 0.06
+           for offset, obs in zip(offsets, (first, middle, recent))):
+        return None
+    if any(b.frame - a.frame > config.max_frame_gap for a, b in zip(lookback, lookback[1:])):
+        return None
+    initial_span = middle.timestamp_sec - first.timestamp_sec
+    final_span = last.timestamp_sec - recent.timestamp_sec
+    if initial_span < 0.1 or final_span < 0.08:
+        return None
+    initial_speed = math.dist(first.center, middle.center) / initial_span
+    if initial_speed < max(config.min_prev_speed_px_s, 0.35 * last.diagonal):
+        return None
+    return (math.dist(recent.center, last.center) / final_span) / initial_speed
+
+
+def _occluded_contact_candidates(
+    tracks: dict[int, list[TrackObservation]],
+    frames: dict[int, list[TrackObservation]],
+    config: AnomalyConfig,
+) -> list[CandidateEvent]:
+    """Keep contacts where braking and a merged detection interrupt one vehicle's track."""
+    if not frames:
+        return []
+    score = _compute_weighted_score(
+        mode="full", speed_drop=True, dir_change=False, very_close=True, overlap=True, post_stopping=False,
+    )
+    if score < config.effective_candidate_threshold():
+        return []
+    last_timestamp = frames[max(frames)][0].timestamp_sec
+    candidates = []
+    for track in tracks.values():
+        last = track[-1]
+        timestamp = last.timestamp_sec
+        end_frame = frames[last.frame]
+        if len(end_frame) < 3 or last_timestamp - timestamp < 0.4 or timestamp - track[0].timestamp_sec < 0.35:
+            continue
+        ratio = _terminal_speed_ratio(track, config)
+        if ratio is None or ratio > 0.30:
+            continue
+        partners = [
+            obs for obs in end_frame if obs.track_id != last.track_id and obs.class_id == last.class_id
+            and 0.01 <= compute_iou(last.box, obs.box) <= 0.45
+        ]
+        replacements = [
+            obs for obs in end_frame if obs.track_id != last.track_id and obs.class_id == last.class_id
+            and timestamp - tracks[obs.track_id][0].timestamp_sec <= 0.25
+            and tracks[obs.track_id][-1].timestamp_sec - timestamp >= 0.33
+            and compute_iou(last.box, obs.box) >= 0.23
+        ]
+        if not replacements:
+            continue
+        recent_track = track[bisect_left(track, timestamp - 0.25, key=lambda obs: obs.timestamp_sec):]
+        for partner in partners:
+            pair_history = [
+                (obs, other) for obs in recent_track
+                for other in frames[obs.frame] if other.track_id == partner.track_id
+            ]
+            if sum(0.07 <= compute_iou(obs.box, other.box) <= 0.45 for obs, other in pair_history) < 3:
+                continue
+            first_partner = pair_history[0][1]
+            if (timestamp - first_partner.timestamp_sec < 0.14
+                or math.dist(first_partner.center, partner.center) < 0.08 * partner.diagonal):
+                continue
+            replacement = next(
+                (obs for obs in replacements if obs.track_id != partner.track_id
+                 and compute_iou(partner.box, obs.box) >= 0.23
+                 and obs.width * obs.height >= 1.1 * max(last.width * last.height, partner.width * partner.height)),
+                None,
+            )
+            if replacement is None:
+                continue
+            pair = sorted((last, partner), key=lambda obs: obs.track_id)
+            anchor = {
+                "timestamp_sec": round(timestamp, 3),
+                "frame_index": last.frame,
+                "candidate_region": [round(value, 2) for value in union_boxes((last.box, partner.box))],
+                "involved_track_ids": [obs.track_id for obs in pair],
+                "involved_classes": [obs.class_name for obs in pair],
+            }
+            candidates.append(CandidateEvent(
+                candidate_id=0, **anchor,
+                clip_start_sec=round(max(0.0, timestamp - config.clip_before_sec), 3),
+                clip_end_sec=round(timestamp + config.clip_after_sec, 3),
+                motion_score=score, max_score=config.max_possible_score(),
+                evidence={"occluded_contact": True, "sudden_speed_drop": True,
+                          "very_close_interaction": True, "bounding_box_overlap": True},
+                metrics={"contact_anchor": anchor, "terminal_speed_ratio": round(ratio, 3),
+                         "replacement_track_id": replacement.track_id},
+            ))
+    return candidates
+
+
+def _single_vehicle_candidates(
+    tracks: dict[int, list[TrackObservation]],
+    frames: dict[int, list[TrackObservation]],
+    tracking_size: tuple[int, int],
+    config: AnomalyConfig,
+) -> list[CandidateEvent]:
+    """Propose interior track losses coupled with sudden trajectory and box changes."""
+    score = 5
+    if not frames or score < config.effective_candidate_threshold():
+        return []
+    width, height = tracking_size
+    frame_numbers = sorted(frames)
+    last_timestamp = frames[frame_numbers[-1]][0].timestamp_sec
+    candidates = []
+    for track in tracks.values():
+        last = track[-1]
+        timestamp = last.timestamp_sec
+        if timestamp - track[0].timestamp_sec < 0.6 or last_timestamp - timestamp < 0.45:
+            continue
+        scale = last.diagonal
+        if scale <= config.eps or min(last.x1, last.y1, width - last.x2, height - last.y2) < 0.25 * scale:
+            continue
+        if last.frame - track[-2].frame > config.max_frame_gap:
+            continue
+        # Compare short, separate windows. The longer Rule B stride can smooth
+        # away the change when only a few frames survive at the end of the track.
+        offsets = (0.44, 0.16, 0.12)
+        lookback = track[bisect_left(track, timestamp - 0.6, key=lambda obs: obs.timestamp_sec):]
+        anchors = [min(lookback, key=lambda obs: abs(timestamp - offset - obs.timestamp_sec))
+                   for offset in offsets]
+        if any(abs(timestamp - offset - obs.timestamp_sec) > 0.06 for offset, obs in zip(offsets, anchors)):
+            continue
+        if any(b.frame - a.frame > config.max_frame_gap for a, b in zip(lookback, lookback[1:])):
+            continue
+        first, previous, recent = anchors
+        incoming = (previous.center_x - first.center_x, previous.center_y - first.center_y)
+        terminal = (last.center_x - recent.center_x, last.center_y - recent.center_y)
+        incoming_length, terminal_length = math.hypot(*incoming), math.hypot(*terminal)
+        if incoming_length < 0.13 * scale or terminal_length < 0.09 * scale:
+            continue
+        cosine = sum(a * b for a, b in zip(incoming, terminal)) / (incoming_length * terminal_length)
+        angle = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+        previous_area = previous.width * previous.height
+        if previous_area <= config.eps:
+            continue
+        box_growth = (last.width * last.height) / previous_area
+        if angle < 18.0 or box_growth < 1.25:
+            continue
+        # An overlapping detection after the loss can be a tracker ID swap.
+        index = bisect_left(frame_numbers, last.frame + 1)
+        replacement = False
+        for frame_index in range(index, len(frame_numbers)):
+            observations = frames[frame_numbers[frame_index]]
+            elapsed = observations[0].timestamp_sec - timestamp
+            if elapsed > 0.52:
+                break
+            if elapsed >= 0.10 and any(compute_iou(last.box, obs.box) >= 0.20 for obs in observations):
+                replacement = True
+                break
+        if replacement:
+            continue
+        candidates.append(CandidateEvent(
+            candidate_id=0,
+            timestamp_sec=round(timestamp, 3),
+            frame_index=last.frame,
+            clip_start_sec=round(max(0.0, timestamp - config.clip_before_sec), 3),
+            clip_end_sec=round(timestamp + config.clip_after_sec, 3),
+            involved_track_ids=[last.track_id],
+            involved_classes=[last.class_name],
+            candidate_region=[round(value, 2) for value in last.box],
+            motion_score=score,
+            max_score=config.max_possible_score(),
+            evidence={"single_vehicle_track_loss": True},
+            metrics={"terminal_direction_change_deg": round(angle, 2), "terminal_box_area_ratio": round(box_growth, 3)},
+        ))
+    return candidates
 
 
 def _pair_rank(inter: _PairInteraction) -> tuple[int, int, float, float]:

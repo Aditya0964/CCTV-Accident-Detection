@@ -5,6 +5,13 @@ from src.run_phase4 import incident_evidence
 
 
 class TestDetectorHandoff(unittest.TestCase):
+    def test_localized_review_accepts_single_vehicle_loss_with_its_own_box(self):
+        candidate = {"timestamp_sec": 3.92, "candidate_region": [10, 20, 30, 40],
+                     "involved_track_ids": [110], "evidence": {"single_vehicle_track_loss": True}}
+        self.assertEqual(localized_review_candidate(candidate), candidate)
+        candidate["involved_track_ids"] = [5, 46]
+        self.assertIsNone(localized_review_candidate(candidate))
+
     def test_localized_review_requires_contact_and_a_motion_response(self):
         anchor = {"timestamp_sec": 1.3, "candidate_region": [3, 5, 9, 10]}
         candidate = {"timestamp_sec": 3.0, "clip_start_sec": 1.0, "clip_end_sec": 4.9,
@@ -18,6 +25,14 @@ class TestDetectorHandoff(unittest.TestCase):
         self.assertEqual(reviewed["clip_end_sec"], 4.9)
         candidate["clip_start_sec"] = 1.5
         self.assertIsNone(localized_review_candidate(candidate))
+        candidate["clip_start_sec"] = 1.0
+        candidate["evidence"]["post_interaction_stopping"] = False
+        self.assertIsNone(localized_review_candidate(candidate))
+        candidate["evidence"]["moving_contact"] = True
+        self.assertEqual(localized_review_candidate(candidate)["timestamp_sec"], 1.3)
+        candidate["evidence"]["moving_contact"] = False
+        candidate["evidence"]["occluded_contact"] = True
+        self.assertEqual(localized_review_candidate(candidate)["timestamp_sec"], 1.3)
 
     def test_localized_vit_incidents_are_used_even_with_a_negative_clip_verdict(self):
         localized = [{"incident_id": "001", "timestamp_sec": 1.0, "candidate_region": [3, 5, 9, 10]}]
@@ -31,6 +46,7 @@ class TestDetectorHandoff(unittest.TestCase):
         self.assertTrue(row["scan_full_frame"])
         self.assertTrue(row["timestamp_is_approximate"])
         self.assertEqual(row["timestamp_sec"], 1.4)
+        self.assertEqual(row["scan_start_sec"], 0.0)
         self.assertIsNone(row["candidate_region"])
 
     def test_fusion_uses_source_pixel_box_only_when_detector_scores_support_it(self):

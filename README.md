@@ -12,9 +12,17 @@ For the fusion path, launch `launch_demo.cmd --backend fusion`. This uses the fu
 
 Phase 4 scans up to five seconds after each localized ViT incident. For a positive clip-level verdict with no localized incident it uses an approximate scan time and a scene-wide scan. Fusion supplies a source-pixel box when the strongest detector score reaches 0.25. A scene-wide finding describes the visible scene and cannot establish which vehicle produced the hazard. Persistent fire gives **High** visual severity, persistent smoke gives **Elevated**, and strong tracked multi-vehicle motion can also give **Elevated**. The report explains its evidence and marks incomplete assessments **Unknown**.
 
-The final preview shows a red **ACCIDENT** label near a localized contact. The ViT review requires a candidate score above 0.80, approaching track overlap, and abrupt braking or deflection followed by stopping. The 0.80 review cutoff is a conservative screening setting. The clip verdict still uses its evaluation report's cutoff. Fusion requires a positive clip verdict and a detector box score of at least 0.80 for the red label.
+The final preview shows a red **ACCIDENT** label near a localized contact. The ViT review requires a candidate score above 0.80 and tracked evidence of a motion response near contact. The motion stage also keeps a separate proposal at the first overlap of two moving vehicles when their boxes close further and one vehicle brakes abruptly or deflects. This lets the review score sideswipes where the vehicles continue moving. The 0.80 review cutoff is a conservative screening setting. The clip verdict uses the cutoff from its evaluation report. Fusion requires a positive clip verdict and a detector box score of at least 0.80 for the red label.
+
+The ViT workflow also proposes a single-vehicle incident when a moving track changes direction, its box suddenly expands, and it disappears well inside the frame. It uses the final tracked box and checks for nearby replacement detections to reduce alerts caused by tracker ID changes. The same ViT cutoff applies.
+
+When two vehicles overlap and one track ends after abrupt braking, the motion stage checks whether a new, larger detection covers both vehicles. If so, it proposes their last separately tracked region for ViT review.
 
 Each run is saved under `outputs/desktop_runs` with the Phase 3 results and rejection reasons, hazard JSON and CSV, the final video preview, and a pipeline log. Use **Open saved analysis** to reopen one of those folders.
+
+The final preview also draws Firewatch boxes near the sampled frames where fire or smoke was seen. A `FIRE CUE` or `SMOKE CUE` label means the detection is visible for review and the scan did not confirm persistent evidence. A scene-wide ViT scan starts up to two seconds before the strongest ViT frame and selecting its row seeks to the strongest hazard cue.
+
+**All candidates** lists every scored ViT motion proposal, including those below the confirmation cutoff. Select a row to seek to its timestamp and inspect its score, scored time window, and review decision. A dashed blue box marks the selected unconfirmed candidate. This view opens by default when the run has proposals, zero localized incidents, and zero hazard cues.
 
 To run Phase 4 on existing Phase 3 output:
 

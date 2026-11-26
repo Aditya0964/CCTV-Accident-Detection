@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -10,7 +11,8 @@ import cv2
 
 
 def render_hazard_preview(
-    video: Path, incidents: list[dict], output: Path, *, show_summary: bool = True, accident_only: bool = False
+    video: Path, incidents: list[dict], output: Path, *, show_summary: bool = True,
+    accident_only: bool = False, show_hazards: bool = False,
 ) -> None:
     """Mark each incident's scan region and optionally show its summary."""
     ordered = sorted(incidents, key=lambda item: item["hazard_scan"]["window_start_sec"])
@@ -30,6 +32,7 @@ def render_hazard_preview(
             (row["timestamp_sec"], row["accident_region_xyxy_source_pixels"])
             for row in incidents if row.get("accident_region_xyxy_source_pixels") is not None
         ]
+        hazards_by_frame = _hazard_overlays(incidents, fps) if show_hazards else {}
         with TemporaryDirectory(dir=output.parent) as folder:
             temporary = Path(folder) / "preview.mp4"
             writer = cv2.VideoWriter(str(temporary), cv2.VideoWriter_fourcc(*"mp4v"),
@@ -58,6 +61,10 @@ def render_hazard_preview(
                                 _draw_region(frame, incident["hazard_scan"]["region_xyxy_source_pixels"])
                                 if show_summary:
                                     _draw_summary(frame, incident)
+                    for (label, box), persistent in hazards_by_frame.get(frame_index, {}).items():
+                        color = (0, 135, 255) if label == "fire" else (210, 173, 85)
+                        text = label.upper() if persistent else f"{label.upper()} CUE"
+                        _draw_labeled_box(frame, box, text, color)
                     if pad_x or pad_y:
                         frame = cv2.copyMakeBorder(frame, 0, pad_y, 0, pad_x, cv2.BORDER_CONSTANT)
                     writer.write(frame)
@@ -77,20 +84,46 @@ def _draw_region(frame, region) -> None:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 205, 82), 2)
 
 
+def _hazard_overlays(incidents: list[dict], fps: float) -> dict:
+    by_frame = defaultdict(dict)
+    for incident in incidents:
+        scan = incident["hazard_scan"]
+        stride = int(scan.get("sample_stride_frames", 1))
+        first = math.ceil(scan["window_start_sec"] * fps - 1e-6)
+        stop = math.ceil(scan["window_end_sec"] * fps - 1e-6)
+        for item in scan.get("detections", []):
+            index = item["frame_index"]
+            label = item["label"]
+            key = label, tuple(item["box_xyxy_source_pixels"])
+            persistent = incident.get(f"{label}_detected") is True
+            # Show sampled boxes briefly and never carry them across an empty sample.
+            start = max(first, index - (stride - 1) // 2)
+            end = min(stop, index + stride // 2 + 1)
+            for frame in range(start, end):
+                by_frame[frame][key] = by_frame[frame].get(key, False) or persistent
+    return by_frame
+
+
 def _draw_accident(frame, region) -> None:
+    _draw_labeled_box(frame, region, "ACCIDENT", (30, 30, 240))
+
+
+def _draw_labeled_box(frame, region, label: str, color: tuple[int, int, int]) -> None:
     height, width = frame.shape[:2]
-    x1, y1, x2, y2 = (round(x) for x in region)
-    red = (30, 30, 240)
+    x1, y1, x2, y2 = (min(limit - 1, max(0, round(value))) for value, limit in
+                      zip(region, (width, height, width, height)))
+    if x1 >= x2 or y1 >= y2:
+        return
     scale = max(0.35, min(0.85, width / 1150))
     line = max(1, round(scale * 2))
     font = cv2.FONT_HERSHEY_SIMPLEX
-    (text_width, text_height), baseline = cv2.getTextSize("ACCIDENT", font, scale, line)
+    (text_width, text_height), baseline = cv2.getTextSize(label, font, scale, line)
     label_x = max(0, min(x1, width - text_width - 10))
     label_y = max(text_height + 4, min(height - baseline - 4, y1 - baseline - 4))
-    cv2.rectangle(frame, (x1, y1), (min(x2, width - 1), min(y2, height - 1)), red, line + 1)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, line + 1)
     cv2.rectangle(frame, (label_x, label_y - text_height - 4),
-                  (label_x + text_width + 8, label_y + baseline + 2), red, cv2.FILLED)
-    cv2.putText(frame, "ACCIDENT", (label_x + 4, label_y), font, scale, (255, 255, 255), line, cv2.LINE_AA)
+                  (label_x + text_width + 8, label_y + baseline + 2), color, cv2.FILLED)
+    cv2.putText(frame, label, (label_x + 4, label_y), font, scale, (255, 255, 255), line, cv2.LINE_AA)
 
 
 def _draw_summary(frame, incident: dict) -> None:

@@ -126,15 +126,20 @@ def _scan_incident(capture, fps, frame_count, incident, detector, settings, regi
     timestamp = float(incident["timestamp_sec"])
     if not math.isfinite(timestamp) or timestamp < 0:
         raise ValueError(f"Invalid incident timestamp: {timestamp}")
-    end_sec = min(timestamp + settings.window_sec, frame_count / fps)
+    scan_start = incident.get("scan_start_sec") if full_frame else None
+    scan_start = timestamp if scan_start is None else float(scan_start)
+    if not math.isfinite(scan_start) or not 0 <= scan_start <= timestamp:
+        raise ValueError(f"Invalid hazard scan start time: {scan_start}")
+    end_sec = min(scan_start + settings.window_sec, frame_count / fps)
     hits = dict.fromkeys(CLASSES, 0)
     best = dict.fromkeys(CLASSES)
     sampled = 0
     requested = 0
+    detections = []
+    stride = max(1, round(fps / settings.sample_fps))
     if region is not None or full_frame:
-        start = math.ceil(timestamp * fps - 1e-6)
+        start = math.ceil(scan_start * fps - 1e-6)
         stop = math.ceil(end_sec * fps - 1e-6)
-        stride = max(1, round(fps / settings.sample_fps))
         for index in range(start, stop, stride):
             requested += 1
             if not capture.set(cv2.CAP_PROP_POS_FRAMES, index):
@@ -148,6 +153,10 @@ def _scan_incident(capture, fps, frame_count, incident, detector, settings, regi
                 if region is not None and box_iou(region, box) < settings.min_iou:
                     continue
                 seen.add(label)
+                detections.append({
+                    "frame_index": index, "label": label, "confidence": round(score, 4),
+                    "box_xyxy_source_pixels": [round(float(value), 2) for value in box],
+                })
                 if best[label] is None or score > best[label][0]:
                     best[label] = (score, index / fps)
             for label in seen:
@@ -179,9 +188,11 @@ def _scan_incident(capture, fps, frame_count, incident, detector, settings, regi
             "region_xyxy_source_pixels": region,
             "sampled_frames": sampled,
             "requested_frames": requested,
-            "window_start_sec": timestamp,
-            "window_end_sec": max(timestamp, end_sec),
+            "window_start_sec": scan_start,
+            "window_end_sec": max(scan_start, end_sec),
             "hits": hits,
+            "sample_stride_frames": stride,
+            "detections": detections,
             "strongest_detection": {
                 label: {"confidence": round(value[0], 4), "timestamp_sec": round(value[1], 3)}
                 if value is not None else None for label, value in best.items()

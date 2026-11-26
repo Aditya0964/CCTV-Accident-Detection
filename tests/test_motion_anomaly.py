@@ -49,6 +49,93 @@ def _make_obs(
 
 
 class TestMotionAnomalyRules(unittest.TestCase):
+    def test_occluded_contact_survives_a_merged_detection(self) -> None:
+        fps = 28.0
+        config = AnomalyConfig(fps=fps, preserve_moving_contacts=True)
+
+        def observations(*, brakes=True, merged=True):
+            rows = []
+            for frame in range(22, 55):
+                offset = frame - 22
+                if frame <= 33:
+                    x = 70 + 11 * min(offset, 7) + max(0, offset - 7) if brakes else 70 + 10 * offset
+                    rows.append(_make_obs(frame, fps, 1, x, 343, w=118 + 7 * offset, h=175,
+                                          class_id=5, class_name="bus"))
+                if frame <= 40:
+                    rows.append(_make_obs(frame, fps, 2, 254 + 14.35 * offset, 400 - 2.8 * offset,
+                                          w=505 - 14 * offset, h=200, class_id=5, class_name="bus"))
+                if merged and frame >= 33:
+                    rows.append(_make_obs(frame, fps, 3, 285 + 9 * (frame - 33), 356,
+                                          w=500, h=210, class_id=5, class_name="bus"))
+            return rows
+
+        def contacts(rows):
+            return [candidate for candidate in analyze_motion_anomalies(rows, config)[1]
+                    if candidate.evidence.get("occluded_contact")]
+
+        [contact] = contacts(observations())
+        self.assertEqual(contact.frame_index, 33)
+        self.assertEqual(contact.involved_track_ids, [1, 2])
+        self.assertEqual(contact.metrics["replacement_track_id"], 3)
+        self.assertEqual(contacts(observations(merged=False)), [])
+        self.assertEqual(contacts(observations(brakes=False)), [])
+
+    def test_single_vehicle_track_loss_requires_interior_motion_and_shape_change(self) -> None:
+        fps = 25.0
+        config = AnomalyConfig(fps=fps, tracking_size=(960, 540))
+
+        def observations(*, deflect=True, x_offset=0, replacement=False):
+            rows = []
+            for frame in range(49):
+                rows.append(_make_obs(frame, fps, 2, 180, 140))
+                if frame <= 29:
+                    elapsed = max(0, frame - 25)
+                    rows.append(_make_obs(
+                        frame, fps, 1, 530 + x_offset - (4 * elapsed if deflect else 0),
+                        375 - 2.6 * frame, w=60 + (4 * elapsed if deflect else 0),
+                        h=46 + (2 * elapsed if deflect else 0),
+                    ))
+                if replacement and 32 <= frame <= 40:
+                    rows.append(_make_obs(frame, fps, 3, 513, 297, w=76, h=54))
+            return rows
+
+        [rollover] = analyze_motion_anomalies(observations(), config)[1]
+        self.assertEqual(rollover.involved_track_ids, [1])
+        self.assertEqual(rollover.frame_index, 29)
+        self.assertTrue(rollover.evidence["single_vehicle_track_loss"])
+        for rows in (observations(deflect=False), observations(x_offset=-470), observations(replacement=True)):
+            with self.subTest(case=rows[-1]):
+                candidates = analyze_motion_anomalies(rows, config)[1]
+                self.assertFalse(any(item.evidence.get("single_vehicle_track_loss") for item in candidates))
+
+    def test_first_contact_is_preserved_when_both_cars_continue_moving(self) -> None:
+        fps = 15.0
+        config = AnomalyConfig(fps=fps, preserve_moving_contacts=True)
+
+        def trajectories(deflect):
+            samples = []
+            for frame in range(24):
+                samples.append(_make_obs(frame, fps, 1, 100 + 24 * frame, 200, w=100, h=45))
+                if not deflect:
+                    x, y = 420 + 3 * frame, 215
+                elif frame < 11:
+                    x, y = 420 + 3 * frame, 270 - 5 * frame
+                else:
+                    x, y = 450 + 8 * (frame - 10), 220 + frame - 10
+                samples.append(_make_obs(frame, fps, 2, x, y, w=100, h=45))
+            return samples
+
+        _, candidates = analyze_motion_anomalies(trajectories(deflect=True), config)
+        [contact] = candidates
+        self.assertEqual(contact.frame_index, 12)
+        self.assertEqual(contact.involved_track_ids, [1, 2])
+        self.assertTrue(contact.evidence["moving_contact"])
+        self.assertFalse(contact.evidence["post_interaction_stopping"])
+        self.assertGreater(contact.metrics["pair_iou"], contact.metrics["initial_pair_iou"])
+
+        _, ordinary_crossing = analyze_motion_anomalies(trajectories(deflect=False), config)
+        self.assertEqual(ordinary_crossing, [])
+
     def test_iou_geometry(self) -> None:
         self.assertAlmostEqual(compute_iou((0, 0, 10, 10), (0, 0, 10, 10)), 1.0)
         self.assertAlmostEqual(compute_iou((0, 0, 10, 10), (20, 20, 30, 30)), 0.0)

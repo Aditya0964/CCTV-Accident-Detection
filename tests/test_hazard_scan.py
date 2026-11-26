@@ -49,6 +49,28 @@ class TestHazardScan(unittest.TestCase):
         self.assertFalse(result["fire_detected"])
         self.assertEqual(result["hazard_scan"]["status"], "scanned")
 
+    def test_scene_scan_starts_before_peak_and_renders_intermittent_fire(self):
+        detector = Mock()
+        detector.detect.side_effect = [[("fire", 0.9, (75, 40, 115, 70))]] + [[]] * 3
+        incident = {"timestamp_sec": 0.6, "scan_start_sec": 0.2, "scan_full_frame": True}
+        [result] = scan_video(self.video, [incident], detector, ScanSettings())
+        self.assertEqual(result["hazard_scan"]["window_start_sec"], 0.2)
+        self.assertEqual(result["hazard_scan"]["detections"][0]["frame_index"], 1)
+        self.assertFalse(result["fire_detected"])
+
+        path = self.video.with_name("fire_cue.mp4")
+        render_hazard_preview(self.video, [result], path, show_summary=False, accident_only=True, show_hazards=True)
+        capture = cv2.VideoCapture(str(path))
+        try:
+            visible = []
+            for _ in range(5):
+                ok, frame = capture.read()
+                self.assertTrue(ok)
+                visible.append(bool(np.any((frame[:, :, 2] > 155) & (frame[:, :, 1] > 80))))
+        finally:
+            capture.release()
+        self.assertEqual(visible, [False, True, False, False, False])
+
     def test_source_space_boxes_and_explicit_scene_wide_scan_can_share_a_report(self):
         detector = Mock()
         detector.detect.return_value = [("smoke", 0.9, (10, 10, 30, 30))]

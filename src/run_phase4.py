@@ -33,6 +33,7 @@ def incident_evidence(clip: dict, localized: list[dict]) -> list[dict]:
         "candidate_region": box if use_box else None,
         "region_space": "source",
         "scan_full_frame": not use_box,
+        "scan_start_sec": max(0.0, peak - 2.0) if not fusion and peak is not None else None,
         "confirmation_policy": "fusion_localized_review" if use_box and box_score >= 0.80 else None,
         "clip_score": clip["fusion_score"] if fusion else clip["p_accident"],
     }]
@@ -59,7 +60,7 @@ def run(video: Path, clip: dict, localized: list[dict], weights: Path, output: P
     if incidents:
         detector = FirewatchDetector(weights, fire_conf=0.40, smoke_conf=0.50)
         results = scan_video(video, incidents, detector, ScanSettings())
-    render_hazard_preview(video, results, preview, show_summary=False, accident_only=True)
+    render_hazard_preview(video, results, preview, show_summary=False, accident_only=True, show_hazards=True)
     (output / "hazard_incidents.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
 
     columns = ("incident_id", "timestamp_sec", "timestamp_is_approximate", "timestamp_source",

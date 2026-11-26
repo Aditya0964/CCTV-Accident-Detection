@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.clip_buffer import extract_candidate_clips, render_anomaly_video
+import cv2
+
+from src.clip_buffer import compute_resized_dimensions, extract_candidate_clips, render_anomaly_video
 from src.motion_anomaly import (
     AnomalyConfig,
     analyze_motion_anomalies,
@@ -17,6 +19,10 @@ from src.motion_anomaly import (
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--preserve-moving-contacts", action="store_true",
+                        help="Keep the first sustained overlap of approaching vehicles as a separate proposal")
+    parser.add_argument("--recover-single-vehicle", action="store_true",
+                        help="Propose abrupt single-vehicle track losses inside the video frame")
     parser.add_argument(
         "--tracks",
         type=Path,
@@ -77,10 +83,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> None:
-    if (args.extract_clips or args.render_video) and args.video is None:
-        raise ValueError("--video is required when --extract-clips or --render-video is set")
+    if (args.extract_clips or args.render_video or args.recover_single_vehicle) and args.video is None:
+        raise ValueError("--video is required for clip extraction, rendering, or single-vehicle proposals")
 
     observations = load_tracks_csv(args.tracks)
+    tracking_size = None
+    if args.recover_single_vehicle:
+        capture = cv2.VideoCapture(str(args.video))
+        try:
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            tracking_size = compute_resized_dimensions(width, height, args.width)
+        finally:
+            capture.release()
     config = AnomalyConfig(
         fps=args.fps,
         mode=args.mode,
@@ -94,6 +109,8 @@ def run(args: argparse.Namespace) -> None:
         merge_window_sec=args.merge_window_sec,
         clip_before_sec=args.clip_before_sec,
         clip_after_sec=args.clip_after_sec,
+        preserve_moving_contacts=args.preserve_moving_contacts,
+        tracking_size=tracking_size,
     )
 
     frame_scores, candidates = analyze_motion_anomalies(observations, config)
