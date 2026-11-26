@@ -1,6 +1,18 @@
-# CCTV Accident Detection — Phase 1
+# CCTV Accident Detection
 
-This starter implements input video processing, pretrained YOLO vehicle detection, ByteTrack association, annotated output and track-data export. It does **not** yet detect accidents.
+The main demo is a validation-tuned fusion of a video classifier, an adapted image classifier, and an accident-box detector. On the labeled clips in `data/raw/`, it reached **67.5% accuracy on 166 held-out, source-disjoint test videos**. See [BENCHMARK.md](BENCHMARK.md) for the full confusion matrix, comparison to individual models, data audit, and limitations. The repository also contains the original vehicle-tracking and motion-candidate pipeline.
+
+## Recommended demo
+
+Put labeled videos in `data/raw/accident/` and `data/raw/normal/`, install the dependencies below, and from the repository root run:
+
+```bash
+python -m src.download_models
+python -m src.fusion_workflow --video data/raw/accident/000831_3.mp4 --output-dir outputs/demo/accident
+python -m src.fusion_workflow --video data/raw/normal/000831_1.mp4 --output-dir outputs/demo/normal
+```
+
+Each command writes a JSON clip verdict and a contact sheet of four sampled frames with accident boxes. The decision is based on the validation-selected fusion score; the box score and fusion score are not calibrated accident probabilities. To reproduce the benchmark, run `python -m src.prepare_benchmark`, then `python -m src.vit_probe`, `python -m src.r3d_probe`, `python -m src.yolo_accident_workflow`, and `python -m src.fusion_workflow`. The last command writes the selected rule and held-out metrics to `outputs/eval/fusion/fusion_evaluation.json`.
 
 ## Setup (Windows PowerShell)
 
@@ -9,6 +21,15 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+```
+
+On a CPU-only Linux machine, install the tested CPU PyTorch wheels before the remaining requirements:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1+cpu torchvision==0.20.1+cpu
+python -m pip install -r requirements.txt
 ```
 
 If you have an NVIDIA GPU, consult the PyTorch official install selector for the correct CUDA-enabled PyTorch build. Check with:
@@ -75,9 +96,26 @@ Outputs:
 
 Phase 3 trains and evaluates binary video classifiers on SCAD clips (`mean_pool` baseline and `cnn_lstm` temporal model), confirms Phase 2 candidates ($P_{\text{acc}} > T_c$), and deduplicates confirmed incidents using a 5-second cooldown event manager.
 
+### Fast pretrained ViT workflow
+
+The [tiya1012 accident-image ViT](https://huggingface.co/tiya1012/vit-accident-image) is a still-image classifier (Apache 2.0). This baseline samples eight frames from each four-second clip and reached 56.0% accuracy on the held-out videos. Use the fusion workflow above for the recommended demo. The model card's reported image accuracy is not this project's video accuracy.
+
+```bash
+python -m src.prepare_benchmark --data-dir data/raw
+python -m src.vit_workflow evaluate
+python -m src.vit_workflow predict --video data/raw/accident/example.mp4
+python -m src.run_vit_pipeline --video data/raw/accident/example.mp4 --output-dir outputs/demo_example
+```
+
+Put source clips under `data/raw/accident/` and `data/raw/normal/`. `prepare_benchmark` ignores unreadable videos, Git LFS pointer files, and exact duplicates; it keeps clips from one original recording together in `data/benchmark_manifest.csv`. The evaluation writes validation and test predictions plus `outputs/eval/vit/vit_evaluation.json`. The single-video command uses the calibrated rule and writes a JSON verdict and annotated MP4 under `outputs/vit_demo/`. `peak_time_sec` marks the strongest sampled image; it is an approximate cue, not a frame-accurate collision timestamp or bounding box.
+
+`run_vit_pipeline` also runs YOLO vehicle tracking and the motion rules, then uses the calibrated ViT to confirm each motion candidate. It writes `pipeline_summary.json`, tracked and confirmed preview videos, candidate clips, and incident logs under the selected output directory. The video-level ViT verdict and localized motion candidates are reported separately because the motion stage can miss an event even when the clip classifier sees one.
+
 ### 1. Train Baseline & CNN + LSTM on SCAD
 
 Supports `{data_dir}/{train,val,test}/{accident,normal}/`, `{data_dir}/{accident,normal}/`, or a `--manifest` CSV (`path,label,split,video_group`):
+
+Training requires a separate validation split. The test split is held out and is never used to select a checkpoint. Clips named like `v51_1.mp4` and `v51_2.mp4` are grouped as source video `v51`. For other naming schemes, assign the same `video_group` in the manifest to clips from one original recording so they cannot be split across train, validation, and test.
 
 ```bash
 python -m src.train_classifier --data-dir data/scad --arch mean_pool --backbone resnet18 --epochs 15 --save-dir outputs/models/baseline
@@ -91,6 +129,9 @@ Compare `CNN + mean pooling` vs. `CNN + LSTM` on `accuracy`, `precision`, `recal
 ```bash
 python -m src.evaluate_classifier --data-dir data/scad --checkpoints outputs/models/baseline/best.pt outputs/models/cnn_lstm/best.pt --output-dir outputs/eval/experiment1
 ```
+
+The evaluation also writes one predictions CSV per checkpoint with each clip's label, accident probability, prediction, and source-video group. Compare accuracy with `majority_class_baseline_accuracy` in the JSON report; a class-imbalanced dataset can make accuracy misleading.
+Choose any probability threshold on validation data, then evaluate that fixed threshold on the held-out test set.
 
 ### 3. Confirm Candidates & Deduplicate Incidents
 

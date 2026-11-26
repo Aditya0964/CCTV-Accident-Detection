@@ -217,7 +217,10 @@ def render_confirmed_preview(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidates", type=Path, default=Path("outputs/candidates.json"))
-    parser.add_argument("--checkpoint", type=Path, required=True, help="Trained classifier checkpoint (.pt)")
+    classifier = parser.add_mutually_exclusive_group(required=True)
+    classifier.add_argument("--checkpoint", type=Path, help="Trained video classifier checkpoint (.pt)")
+    classifier.add_argument("--vit-calibration", type=Path, help="ViT evaluation JSON with a validated decision rule")
+    parser.add_argument("--vit-cache-dir", type=Path, default=Path("outputs/model_cache"))
     parser.add_argument("--threshold", type=float, default=None, help="Override P(accident) confirmation cutoff T_c")
     parser.add_argument("--cooldown-sec", type=float, default=5.0)
     parser.add_argument("--region-iou-threshold", type=float, default=0.10)
@@ -236,8 +239,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     candidates = _load_candidates(args.candidates)
     device = resolve_device(args.device)
-    model, cfg, _ = load_checkpoint(args.checkpoint, device=device)
-    cutoff = args.threshold if args.threshold is not None else cfg.threshold
+    if args.vit_calibration is not None:
+        from src.vit_workflow import DecisionRule, ViTAccidentClassifier, aggregate
+
+        calibration = json.loads(args.vit_calibration.read_text(encoding="utf-8"))
+        rule = DecisionRule(**calibration["rule"])
+        vit_model = ViTAccidentClassifier(calibration["model"], args.vit_cache_dir, str(device))
+        cutoff = args.threshold if args.threshold is not None else rule.threshold
+        num_frames = int(calibration["frames_per_clip"])
+    else:
+        model, cfg, _ = load_checkpoint(args.checkpoint, device=device)
+        cutoff = args.threshold if args.threshold is not None else cfg.threshold
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     logger = AccidentEventLogger(output_dir=args.output_dir, append=False, echo_console=False)
@@ -249,14 +261,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     confirmation_results: list[dict[str, Any]] = []
     for cand in sorted(candidates, key=lambda c: float(c["timestamp_sec"])):
-        p_acc = _score_candidate_clip(
-            cand,
-            model=model,
-            num_frames=cfg.num_frames,
-            input_size=cfg.input_size,
-            device=device,
-            fallback_video=args.video,
-        )
+        if args.vit_calibration is not None:
+            clip_path = Path(cand["clip_path"]) if cand.get("clip_path") else None
+            if clip_path is not None and clip_path.is_file():
+                frame_scores = vit_model.score(clip_path, num_frames)
+            elif args.video is not None and args.video.is_file():
+                frame_scores = vit_model.score(
+                    args.video, num_frames,
+                    float(cand.get("clip_start_sec", 0.0)),
+                    float(cand.get("clip_end_sec", 0.0)),
+                )
+            else:
+                raise FileNotFoundError(f"No video for candidate #{cand.get('candidate_id')}")
+            p_acc = aggregate(frame_scores["frame_probabilities"], rule.aggregation)
+        else:
+            p_acc = _score_candidate_clip(
+                cand, model=model, num_frames=cfg.num_frames, input_size=cfg.input_size,
+                device=device, fallback_video=args.video,
+            )
         confirmed = p_acc > cutoff
         incident_id: Optional[str] = None
         is_new_incident = False

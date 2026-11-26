@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 from typing import Any, Optional
@@ -188,7 +189,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             model, loader, device=device, threshold=args.threshold
         )
 
-        run_label = f"{ckpt_path.parent.name}_{cfg.arch}" if ckpt_path.parent.name else f"model_{idx}"
+        run_label = f"{idx}_{ckpt_path.parent.name}_{cfg.arch}"
         cm_path = args.output_dir / f"cm_{run_label}.png"
         save_confusion_matrix_plot(
             metrics["confusion_matrix"],
@@ -196,12 +197,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             output_path=cm_path,
         )
 
+        predictions_path = args.output_dir / f"predictions_{run_label}.csv"
+        with predictions_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["path", "actual", "p_accident", "predicted", "correct", "video_group"])
+            for sample, actual, probability in zip(samples, y_true, y_prob):
+                predicted = int(float(probability) > args.threshold)
+                writer.writerow(
+                    [str(sample.path), int(actual), round(float(probability), 6), predicted,
+                     int(predicted == int(actual)), sample.video_group]
+                )
+
         entry: dict[str, Any] = {
             "checkpoint": str(ckpt_path),
             "arch": cfg.arch,
             "backbone": cfg.backbone,
             "metrics": metrics,
             "confusion_matrix_plot": str(cm_path),
+            "predictions_csv": str(predictions_path),
+            "majority_class_baseline_accuracy": round(
+                max(metrics["support_pos"], metrics["support_neg"]) / len(samples), 4
+            ),
         }
         if args.sweep_thresholds:
             entry["threshold_sweep"] = sweep_thresholds(y_true, y_prob)

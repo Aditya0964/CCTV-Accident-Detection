@@ -14,6 +14,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from src.video_groups import infer_video_group as _infer_video_group
+
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp"}
 
@@ -58,16 +60,6 @@ def _is_frame_dir(path: Path) -> bool:
     return any(p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS for p in path.iterdir())
 
 
-def _infer_video_group(path: Path) -> str:
-    """Extract parent scene/video identifier to avoid clip leakage across splits."""
-    stem = path.stem
-    if "_clip_" in stem:
-        return stem.split("_clip_", 1)[0]
-    if "_seg_" in stem:
-        return stem.split("_seg_", 1)[0]
-    return stem
-
-
 def _collect_class_items(class_dir: Path, label: int, split: str) -> list[ClipSample]:
     items: list[ClipSample] = []
     if not class_dir.is_dir():
@@ -100,13 +92,16 @@ def _split_by_group(
     rng = random.Random(seed)
     splits: dict[str, list[ClipSample]] = {"train": [], "val": [], "test": []}
 
-    for label in (0, 1):
-        grouped: dict[str, list[ClipSample]] = defaultdict(list)
-        for sample in samples:
-            if sample.label == label:
-                grouped[sample.video_group].append(sample)
+    grouped: dict[str, list[ClipSample]] = defaultdict(list)
+    for sample in samples:
+        grouped[sample.video_group].append(sample)
 
-        group_keys = sorted(grouped.keys())
+    for label in (0, 1):
+        # Keep every clip from one recording together, even if it contains both labels.
+        group_keys = sorted(
+            key for key, items in grouped.items()
+            if int(any(item.label == 1 for item in items)) == label
+        )
         rng.shuffle(group_keys)
         n_groups = len(group_keys)
         n_test = round(n_groups * test_ratio) if test_ratio > 0 and n_groups >= 3 else 0
@@ -118,7 +113,8 @@ def _split_by_group(
         test_groups = set(group_keys[:n_test])
         val_groups = set(group_keys[n_test : n_test + n_val])
 
-        for gkey, group_items in grouped.items():
+        for gkey in group_keys:
+            group_items = grouped[gkey]
             target_split = (
                 "test" if gkey in test_groups else ("val" if gkey in val_groups else "train")
             )
@@ -130,6 +126,18 @@ def _split_by_group(
     for split_list in splits.values():
         split_list.sort(key=lambda s: str(s.path))
     return splits
+
+
+def _ensure_disjoint_groups(splits: dict[str, list[ClipSample]]) -> None:
+    owners: dict[str, str] = {}
+    for split, samples in splits.items():
+        for sample in samples:
+            previous = owners.setdefault(sample.video_group, split)
+            if previous != split:
+                raise ValueError(
+                    f"Video group '{sample.video_group}' occurs in both '{previous}' "
+                    f"and '{split}' splits; keep clips from one recording together."
+                )
 
 
 def discover_scad_samples(
@@ -164,6 +172,7 @@ def discover_scad_samples(
             auto = _split_by_group(unsplit, val_ratio=val_ratio, test_ratio=test_ratio, seed=seed)
             for sp in ("train", "val", "test"):
                 splits[sp].extend(auto[sp])
+        _ensure_disjoint_groups(splits)
         return splits
 
     if data_root is None or not data_root.is_dir():
@@ -194,6 +203,7 @@ def discover_scad_samples(
             re_split = _split_by_group(splits["train"], val_ratio=val_ratio, test_ratio=0.0, seed=seed)
             splits["train"] = re_split["train"]
             splits["val"] = re_split["val"]
+        _ensure_disjoint_groups(splits)
         return splits
 
     # Case 2: {data_root}/{accident,normal}/...
@@ -213,7 +223,9 @@ def discover_scad_samples(
             "Expected class folders (e.g. accident/ and normal/) or train/val/test subdirs."
         )
 
-    return _split_by_group(all_samples, val_ratio=val_ratio, test_ratio=test_ratio, seed=seed)
+    splits = _split_by_group(all_samples, val_ratio=val_ratio, test_ratio=test_ratio, seed=seed)
+    _ensure_disjoint_groups(splits)
+    return splits
 
 
 def _compute_sample_indices(

@@ -80,11 +80,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     splits = discover_scad_samples(data_root=args.data_dir, manifest_csv=args.manifest, seed=args.seed)
 
     train_samples = splits["train"]
-    val_samples = splits["val"] if splits["val"] else splits["test"]
+    val_samples = splits["val"]
     if not train_samples:
         raise RuntimeError("No training samples discovered")
     if not val_samples:
-        val_samples = train_samples
+        raise RuntimeError(
+            "No validation samples discovered. Provide a separate val split or more "
+            "source-video groups for the automatic split; test data must remain held out."
+        )
 
     config = ModelConfig(
         arch=args.arch,
@@ -152,6 +155,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        if args.freeze_backbone:
+            # Frozen batch-normalization statistics must also remain frozen.
+            model.backbone.eval()
         running_loss = 0.0
         seen = 0
         for clips, labels in train_loader:

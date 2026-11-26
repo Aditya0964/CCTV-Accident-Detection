@@ -18,7 +18,7 @@ from src.evaluate_classifier import compute_binary_metrics
 from src.evaluate_classifier import parse_args as parse_eval_args
 from src.evaluate_classifier import run as run_eval
 from src.event_manager import AccidentEventManager
-from src.scad_dataset import discover_scad_samples, sample_video_frames
+from src.scad_dataset import _infer_video_group, discover_scad_samples, sample_video_frames
 from src.train_classifier import parse_args as parse_train_args
 from src.train_classifier import run as run_train
 from src.video_classifier import (
@@ -63,6 +63,12 @@ def _write_frame_dir(
 
 
 class TestSCADDatasetAndModels(unittest.TestCase):
+    def test_numbered_clips_share_source_group(self) -> None:
+        self.assertEqual(_infer_video_group(Path("v51_1.mp4")), "v51")
+        self.assertEqual(_infer_video_group(Path("v51_5.mp4")), "v51")
+        self.assertEqual(_infer_video_group(Path("000065_2.mp4")), "000065")
+        self.assertEqual(_infer_video_group(Path("RoadAccidents113_x264_4 (1).mp4")), "roadaccidents113_x264")
+
     def test_group_split_prevents_clip_leakage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -81,6 +87,31 @@ class TestSCADDatasetAndModels(unittest.TestCase):
             self.assertFalse(groups_by_split["train"] & groups_by_split["val"])
             self.assertFalse(groups_by_split["train"] & groups_by_split["test"])
             self.assertFalse(groups_by_split["val"] & groups_by_split["test"])
+
+    def test_mixed_label_recording_stays_in_one_split(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for g in range(6):
+                _write_test_clip(root / "accident" / f"scene{g}_clip_1.mp4", num_frames=6)
+                _write_test_clip(root / "normal" / f"scene{g}_clip_2.mp4", num_frames=6)
+            splits = discover_scad_samples(data_root=root, val_ratio=0.2, test_ratio=0.2)
+            group_splits = {
+                group: {sp for sp, samples in splits.items() if any(s.video_group == group for s in samples)}
+                for group in (f"scene{g}" for g in range(6))
+            }
+            self.assertTrue(all(len(owners) == 1 for owners in group_splits.values()))
+
+    def test_manifest_rejects_group_in_multiple_splits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "manifest.csv"
+            with manifest.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["path", "label", "split", "video_group"])
+                writer.writerow(["one.mp4", "accident", "train", "same_source"])
+                writer.writerow(["two.mp4", "normal", "test", "same_source"])
+            with self.assertRaisesRegex(ValueError, "same_source"):
+                discover_scad_samples(data_root=root, manifest_csv=manifest)
 
     def test_manifest_and_frame_dir_sampling(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -137,6 +168,18 @@ class TestSCADDatasetAndModels(unittest.TestCase):
 
 
 class TestTrainingEvaluationAndConfirmation(unittest.TestCase):
+    def test_training_requires_separate_validation_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "manifest.csv"
+            with manifest.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["path", "label", "split", "video_group"])
+                writer.writerow(["train.mp4", "accident", "train", "train_source"])
+                writer.writerow(["test.mp4", "normal", "test", "test_source"])
+            with self.assertRaisesRegex(RuntimeError, "No validation samples"):
+                run_train(parse_train_args(["--manifest", str(manifest), "--device", "cpu"]))
+
     def test_compute_binary_metrics_exact(self) -> None:
         y_true = np.array([1, 1, 0, 0, 1, 0])
         y_prob = np.array([0.9, 0.4, 0.8, 0.1, 0.7, 0.2])
@@ -305,6 +348,8 @@ class TestTrainingEvaluationAndConfirmation(unittest.TestCase):
             self.assertTrue((eval_dir / "experiment1_metrics.json").is_file())
             for entry in report["models"]:
                 self.assertTrue(Path(entry["confusion_matrix_plot"]).is_file())
+                with Path(entry["predictions_csv"]).open(newline="", encoding="utf-8") as handle:
+                    self.assertEqual(len(list(csv.DictReader(handle))), 4)
 
             # Test Phase 3 confirmation + cooldown + Experiment 3 + preview video.
             full_video = tmp_dir / "cctv.mp4"
